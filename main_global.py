@@ -33,48 +33,91 @@ class HeightsResult:
 
 
 # ============================================================
-# DTM（GeoTIFF）から地面高さ取得（バイリニア補間固定）
+# DTM（GeoTIFF）から地面高さ取得（標準的バイリニア補間）
+#   - 位置(x,y)を「浮動小数のピクセル座標(col_f,row_f)」に変換
+#   - floorを左上(c0,r0)として2x2を取り、小数部(fx,fy)で補間
+#   - nodataが混ざる場合は近傍の有効値へフォールバック
 # ============================================================
 def sample_dtm_height(dtm_path: str, lat: float, lon: float) -> float:
     with rasterio.open(dtm_path) as ds:
         if ds.crs is None:
             raise ValueError("DTM GeoTIFF に CRS が定義されていません。")
 
+        # WGS84 -> DTM CRS
         transformer = Transformer.from_crs(CRS.from_epsg(4326), ds.crs, always_xy=True)
         x, y = transformer.transform(lon, lat)
 
-        row, col = ds.index(x, y)
-        if not (0 <= row < ds.height and 0 <= col < ds.width):
+        # (x,y) -> (col,row) 浮動小数ピクセル座標
+        # 注意: rasterio transform は (col,row)->(x,y) の写像。逆変換で (col,row) を得る。
+        col_f, row_f = (~ds.transform) * (x, y)
+
+        # 範囲チェック（厳密：外はエラー）
+        if not (0.0 <= col_f <= (ds.width - 1) and 0.0 <= row_f <= (ds.height - 1)):
             raise ValueError("指定した地点は DTM の範囲外です。")
 
-        r0 = max(row - 1, 0)
-        c0 = max(col - 1, 0)
-        r1 = min(r0 + 2, ds.height)
-        c1 = min(c0 + 2, ds.width)
+        # 2x2を必ず確保するため、端は内側に寄せる
+        # c0 in [0, width-2], r0 in [0, height-2]
+        c0 = int(math.floor(col_f))
+        r0 = int(math.floor(row_f))
+        c0 = min(max(c0, 0), ds.width - 2) if ds.width >= 2 else 0
+        r0 = min(max(r0, 0), ds.height - 2) if ds.height >= 2 else 0
+        c1 = min(c0 + 1, ds.width - 1)
+        r1 = min(r0 + 1, ds.height - 1)
 
-        data = ds.read(1, window=((r0, r1), (c0, c1))).astype(np.float64)
+        # 2x2を読み込む（Windowは [start, stop) なので +2）
+        # ただし幅/高さが1のラスタにも一応対応
+        w_c1 = c0 + 2 if ds.width >= 2 else c0 + 1
+        w_r1 = r0 + 2 if ds.height >= 2 else r0 + 1
 
+        data = ds.read(1, window=((r0, w_r1), (c0, w_c1))).astype(np.float64)
+
+        # 1x1しか取れないなど、2x2にならない場合は最近傍
         if data.shape != (2, 2):
-            return float(data[0, 0])
+            # 最近傍：col_f,row_f を丸める
+            rr = int(round(row_f))
+            cc = int(round(col_f))
+            rr = min(max(rr, 0), ds.height - 1)
+            cc = min(max(cc, 0), ds.width - 1)
+            v = float(ds.read(1, window=((rr, rr + 1), (cc, cc + 1)))[0, 0])
+            return v
 
-        def pixel_center(rr: int, cc: int) -> Tuple[float, float]:
-            px, py = rasterio.transform.xy(ds.transform, rr, cc, offset="center")
-            return float(px), float(py)
+        # 重み（小数部）
+        fx = float(np.clip(col_f - c0, 0.0, 1.0))
+        fy = float(np.clip(row_f - r0, 0.0, 1.0))
 
-        x00, y00 = pixel_center(r0, c0)
-        x11, y11 = pixel_center(r0 + 1, c0 + 1)
+        # nodata処理（あれば NaN 扱いにする）
+        nodata = ds.nodata
+        if nodata is not None:
+            data = np.where(data == float(nodata), np.nan, data)
 
-        fx = (x - x00) / (x11 - x00 if x11 != x00 else 1.0)
-        fy = (y - y00) / (y11 - y00 if y11 != y00 else 1.0)
-        fx = float(np.clip(fx, 0.0, 1.0))
-        fy = float(np.clip(fy, 0.0, 1.0))
-
+        # 4点の値（row方向が下、col方向が右）
         v00, v10 = data[0, 0], data[0, 1]
         v01, v11 = data[1, 0], data[1, 1]
 
-        v0 = v00 * (1 - fx) + v10 * fx
-        v1 = v01 * (1 - fx) + v11 * fx
-        return float(v0 * (1 - fy) + v1 * fy)
+        # nodata混入時：近傍の有効値にフォールバック
+        if np.isnan([v00, v10, v01, v11]).any():
+            candidates = []
+            # 各コーナーのピクセル座標
+            corners = [
+                (r0, c0, v00),
+                (r0, c1, v10),
+                (r1, c0, v01),
+                (r1, c1, v11),
+            ]
+            for rr, cc, vv in corners:
+                if not np.isnan(vv):
+                    # ピクセル座標空間で距離
+                    d2 = (row_f - rr) ** 2 + (col_f - cc) ** 2
+                    candidates.append((d2, float(vv)))
+            if not candidates:
+                raise ValueError("DTMの2x2近傍がすべて nodata でした。")
+            candidates.sort(key=lambda t: t[0])
+            return candidates[0][1]
+
+        # 標準的バイリニア補間
+        v0 = v00 * (1.0 - fx) + v10 * fx
+        v1 = v01 * (1.0 - fx) + v11 * fx
+        return float(v0 * (1.0 - fy) + v1 * fy)
 
 
 # ============================================================
@@ -230,12 +273,12 @@ def print_result(res: HeightsResult) -> None:
 
 
 if __name__ == "__main__":
-    dtm_path = "../opt-route/data_v2/DTM.tiff"
+    dtm_path = "./data/DTM_Naha.tif"
     geoid_pgm_path = "./data/egm2008-1.pgm"
     vertical_datum: VerticalDatum = "DTM_IS_MSL"
 
-    lat = 24.77236672963945
-    lon = 125.3419969747311
+    lat = 26.186898142655217
+    lon = 127.8151512771811
 
     res = compute_heights(
         lat, lon,
@@ -244,4 +287,3 @@ if __name__ == "__main__":
         geoid_pgm_path=geoid_pgm_path,
     )
     print_result(res)
-

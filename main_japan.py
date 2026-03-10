@@ -34,7 +34,10 @@ class HeightsResult:
 
 
 # ============================================================
-# DTM（GeoTIFF）から地面高さ取得（バイリニア補間固定）
+# DTM（GeoTIFF）から地面高さ取得（標準的バイリニア補間）
+#   - 位置(x,y)を「浮動小数のピクセル座標(col_f,row_f)」に変換
+#   - floorを左上(c0,r0)として2x2を取り、小数部(fx,fy)で補間
+#   - nodataが混ざる場合は近傍の有効値へフォールバック
 # ============================================================
 def sample_dtm_height(dtm_path: str, lat: float, lon: float) -> float:
     with rasterio.open(dtm_path) as ds:
@@ -44,39 +47,61 @@ def sample_dtm_height(dtm_path: str, lat: float, lon: float) -> float:
         transformer = Transformer.from_crs(CRS.from_epsg(4326), ds.crs, always_xy=True)
         x, y = transformer.transform(lon, lat)
 
-        row, col = ds.index(x, y)
-        if not (0 <= row < ds.height and 0 <= col < ds.width):
+        col_f, row_f = (~ds.transform) * (x, y)
+
+        if not (0.0 <= col_f <= (ds.width - 1) and 0.0 <= row_f <= (ds.height - 1)):
             raise ValueError("指定した地点は DTM の範囲外です。")
 
-        r0 = max(row - 1, 0)
-        c0 = max(col - 1, 0)
-        r1 = min(r0 + 2, ds.height)
-        c1 = min(c0 + 2, ds.width)
+        c0 = int(math.floor(col_f))
+        r0 = int(math.floor(row_f))
+        c0 = min(max(c0, 0), ds.width - 2) if ds.width >= 2 else 0
+        r0 = min(max(r0, 0), ds.height - 2) if ds.height >= 2 else 0
+        c1 = min(c0 + 1, ds.width - 1)
+        r1 = min(r0 + 1, ds.height - 1)
 
-        data = ds.read(1, window=((r0, r1), (c0, c1))).astype(np.float64)
+        w_c1 = c0 + 2 if ds.width >= 2 else c0 + 1
+        w_r1 = r0 + 2 if ds.height >= 2 else r0 + 1
 
-        # 端に当たって2x2にならないなら最近傍
+        data = ds.read(1, window=((r0, w_r1), (c0, w_c1))).astype(np.float64)
+
         if data.shape != (2, 2):
-            return float(data[0, 0])
+            rr = int(round(row_f))
+            cc = int(round(col_f))
+            rr = min(max(rr, 0), ds.height - 1)
+            cc = min(max(cc, 0), ds.width - 1)
+            v = float(ds.read(1, window=((rr, rr + 1), (cc, cc + 1)))[0, 0])
+            return v
 
-        def pixel_center(rr: int, cc: int) -> Tuple[float, float]:
-            px, py = rasterio.transform.xy(ds.transform, rr, cc, offset="center")
-            return float(px), float(py)
+        fx = float(np.clip(col_f - c0, 0.0, 1.0))
+        fy = float(np.clip(row_f - r0, 0.0, 1.0))
 
-        x00, y00 = pixel_center(r0, c0)
-        x11, y11 = pixel_center(r0 + 1, c0 + 1)
-
-        fx = (x - x00) / (x11 - x00 if x11 != x00 else 1.0)
-        fy = (y - y00) / (y11 - y00 if y11 != y00 else 1.0)
-        fx = float(np.clip(fx, 0.0, 1.0))
-        fy = float(np.clip(fy, 0.0, 1.0))
+        nodata = ds.nodata
+        if nodata is not None:
+            data = np.where(data == float(nodata), np.nan, data)
 
         v00, v10 = data[0, 0], data[0, 1]
         v01, v11 = data[1, 0], data[1, 1]
 
-        v0 = v00 * (1 - fx) + v10 * fx
-        v1 = v01 * (1 - fx) + v11 * fx
-        return float(v0 * (1 - fy) + v1 * fy)
+        if np.isnan([v00, v10, v01, v11]).any():
+            candidates = []
+            corners = [
+                (r0, c0, v00),
+                (r0, c1, v10),
+                (r1, c0, v01),
+                (r1, c1, v11),
+            ]
+            for rr, cc, vv in corners:
+                if not np.isnan(vv):
+                    d2 = (row_f - rr) ** 2 + (col_f - cc) ** 2
+                    candidates.append((d2, float(vv)))
+            if not candidates:
+                raise ValueError("DTMの2x2近傍がすべて nodata でした。")
+            candidates.sort(key=lambda t: t[0])
+            return candidates[0][1]
+
+        v0 = v00 * (1.0 - fx) + v10 * fx
+        v1 = v01 * (1.0 - fx) + v11 * fx
+        return float(v0 * (1.0 - fy) + v1 * fy)
 
 
 # ============================================================
@@ -345,12 +370,12 @@ def print_result(res: HeightsResult) -> None:
 
 
 if __name__ == "__main__":
-    dtm_path = "../opt-route/data_v2/DTM.tiff"
+    dtm_path = "./data/DTM_Naha.tif"
     isg_path = "./data/JPGEO2024.isg"
     vertical_datum: VerticalDatum = "DTM_IS_MSL"
 
-    lat = 24.77236672963945
-    lon = 125.3419969747311
+    lat = 26.186898142655217
+    lon = 127.8151512771811
 
     res = compute_heights(
         lat, lon,
